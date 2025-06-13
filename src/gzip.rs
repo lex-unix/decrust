@@ -1,4 +1,4 @@
-use anyhow::{self, Result, ensure};
+use anyhow::{self, Ok, Result, bail, ensure};
 
 const ID1: u8 = 0x1F;
 const ID2: u8 = 0x8B;
@@ -105,9 +105,17 @@ impl<'a> Decoder<'a> {
             let _crc16 = self.read_bytes(2)?;
         }
 
-        // NOTE: following is compressed data, CRC32, and ISIZE
+        // NOTE: rest of the stream is compressed data, CRC32, and ISIZE
 
         Ok(())
+    }
+
+    pub fn decode(&mut self) -> Result<Vec<u8>> {
+        self.parse_header()?;
+
+        let mut bitstream = BitStream::new(&self.input_stream[self.pos..]);
+
+        infalte(&mut bitstream)
     }
 
     fn read_byte(&mut self) -> Result<u8> {
@@ -135,5 +143,185 @@ impl<'a> Decoder<'a> {
             bytes.push(byte);
         }
         String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("Invalid UTF-8 in string: {}", e))
+    }
+}
+
+// Most of the following code is adapted from madler/zlib
+// Available at: https://github.com/madler/zlib/blob/master/contrib/puff/puff.c
+
+fn infalte(bitstream: &mut BitStream) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+
+    loop {
+        let is_final = bitstream.read(1)? == 1;
+        let block_type = bitstream.read(2)?;
+
+        match block_type {
+            0 => todo!("uncompressed block"),
+            1 => huff_fixed(bitstream, &mut output)?,
+            2 => todo!("compressed with dynamic huffman codes"),
+            _ => bail!("reserved block type"),
+        };
+
+        if is_final {
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
+#[derive(Debug, Default)]
+struct Huffman {
+    symbols: Vec<u16>,
+    count: Vec<u16>,
+}
+
+fn huff_fixed(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
+    let mut lengths: [u16; 288] = [0; 288];
+    lengths[..=143].fill(8);
+    lengths[144..=255].fill(9);
+    lengths[256..=279].fill(7);
+    lengths[280..=287].fill(8);
+
+    let distances: [u16; 30] = [5; 30];
+
+    let len_huff = huff_table(&lengths);
+    let dist_huff = huff_table(&distances);
+
+    let lens = [
+        /* Size base for length codes 257..285 */
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+        131, 163, 195, 227, 258,
+    ];
+    let lext = [
+        /* Extra bits for length codes 257..285 */
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    ];
+    let dists = [
+        /* Offset base for distance codes 0..29 */
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    ];
+    let dext = [
+        /* Extra bits for distance codes 0..29 */
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+        13, 13,
+    ];
+
+    loop {
+        let symbol = decode(bitstream, &len_huff)?;
+        match symbol {
+            0..256 => {
+                output.push(symbol as u8);
+            }
+            257..285 => {
+                let symbol = symbol - 257;
+                ensure!(symbol < 29, "invalid symbol len");
+                let mut len = lens[symbol as usize] + bitstream.read(lext[symbol as usize])?;
+                let symbol = decode(bitstream, &dist_huff)?;
+                ensure!(symbol > 0, "invalid symbol len");
+                let dist = dists[symbol as usize] + bitstream.read(dext[symbol as usize])?;
+                ensure!((dist as usize) < output.len(), "invalid len symbol");
+                while len > 0 {
+                    let literal = output[output.len() - (dist as usize)];
+                    output.push(literal);
+                    len -= 1;
+                }
+            }
+            256 => break,
+            _ => unreachable!("shouldn't happen"),
+        }
+    }
+
+    Ok(())
+}
+
+fn huff_table(code_lengths: &[u16]) -> Huffman {
+    let mut huff = Huffman::default();
+    huff.count.resize(16, 0);
+    huff.symbols.resize(288, 0);
+
+    for symbol in 0..code_lengths.len() {
+        let index = code_lengths[symbol];
+        huff.count[index as usize] += 1;
+    }
+
+    let mut offsets = [0; 16];
+    for i in 1..15 {
+        offsets[i + 1] = offsets[i] + huff.count[i];
+    }
+
+    for symbol in 0..code_lengths.len() {
+        if code_lengths[symbol] != 0 {
+            let symbol_len = code_lengths[symbol];
+            let offset = offsets[symbol_len as usize];
+            huff.symbols[offset as usize] = symbol as u16;
+            offsets[symbol_len as usize] += 1;
+        }
+    }
+
+    huff
+}
+
+fn decode(bitstream: &mut BitStream, huff: &Huffman) -> Result<u16, anyhow::Error> {
+    let mut code: u32 = 0;
+    let mut first: u32 = 0;
+    let mut index: u32 = 0;
+
+    for len in 1..=15 {
+        // Read the next bit and append it to the current code
+        code |= bitstream.read(1)? as u32;
+
+        let count = huff.count[len] as u32;
+
+        if code - first < count {
+            let symbol_index = index + (code - first);
+            let result = huff.symbols[symbol_index as usize];
+            return Ok(result);
+        }
+
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+
+    Err(anyhow::anyhow!("unable to decode"))
+}
+
+struct BitStream<'a> {
+    bytes: &'a [u8],
+    byte_pos: usize,
+    buf: u32,
+    bits_in_buf: u32,
+}
+
+impl<'a> BitStream<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_pos: 0,
+            buf: 0,
+            bits_in_buf: 0,
+        }
+    }
+
+    fn read(&mut self, need: u32) -> Result<u32> {
+        let mut val = self.buf;
+
+        while self.bits_in_buf < need {
+            if self.byte_pos == self.bytes.len() {
+                bail!("Unexpected EOF")
+            }
+            val |= (self.bytes[self.byte_pos] as u32) << self.bits_in_buf;
+            self.byte_pos += 1;
+            self.bits_in_buf += 8;
+        }
+
+        self.buf = val >> need;
+        self.bits_in_buf -= need;
+
+        Ok(val & ((1 << need) - 1))
     }
 }

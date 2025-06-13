@@ -25,11 +25,22 @@ fn main() -> Result<()> {
         Some(Commands::Extract) => {
             let input = fs::read("./test.txt.gz").context("read test file")?;
             let mut decoder = Decoder::new(&input);
-            match decoder.parse_header() {
-                Ok(()) => println!(
-                    "Name: {}, ModTime: {}, OS: {}",
-                    decoder.header.name, decoder.header.modtime, decoder.header.os
-                ),
+            match decoder.decode() {
+                Ok(output) => {
+                    if let Ok(decoded) = String::from_utf8(output) {
+                        println!("Got decoded contents:\n{decoded}");
+                    } else {
+                        println!("invalid utf-8 string");
+                    }
+                    println!(
+                        "Parsed Header:\nName: {}, ModTime: {}, OS: {}, Extra: {:?}, Comment: {}",
+                        decoder.header.name,
+                        decoder.header.modtime,
+                        decoder.header.os,
+                        decoder.header.extra,
+                        decoder.header.comment
+                    );
+                }
                 Err(e) => return Err(e),
             };
         }
