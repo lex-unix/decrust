@@ -113,8 +113,6 @@ impl<'a> Decoder<'a> {
     pub fn decode(&mut self) -> Result<Vec<u8>> {
         self.parse_header()?;
 
-        println!("header parsed");
-
         let mut bitstream = BitStream::new(&self.input_stream[self.pos..]);
 
         infalte(&mut bitstream)
@@ -159,12 +157,9 @@ fn infalte(bitstream: &mut BitStream) -> Result<Vec<u8>> {
         let block_type = bitstream.read(2)?;
 
         match block_type {
-            0 => todo!("uncompressed block"),
+            0 => uncompressed(bitstream, &mut output)?,
             1 => huff_fixed(bitstream, &mut output)?,
-            2 => {
-                println!("dynamic huffman compression");
-                huff_dynamic(bitstream, &mut output)?;
-            }
+            2 => huff_dynamic(bitstream, &mut output)?,
             _ => bail!("reserved block type"),
         };
 
@@ -174,6 +169,24 @@ fn infalte(bitstream: &mut BitStream) -> Result<Vec<u8>> {
     }
 
     Ok(output)
+}
+
+fn uncompressed(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
+    bitstream.discard();
+
+    let lencom = bitstream.get_bytes(4)?;
+    let len = &lencom[..2];
+    let com = &lencom[2..];
+
+    let len = u16::from_le_bytes([len[0], len[1]]);
+    let com = u16::from_le_bytes([com[0], com[1]]);
+
+    ensure!(com == !len, "one's complement verification failed");
+
+    let data = bitstream.get_bytes(len as usize)?;
+    output.extend_from_slice(data);
+
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -396,5 +409,21 @@ impl<'a> BitStream<'a> {
         self.bits_in_buf -= need;
 
         Ok(val & ((1 << need) - 1))
+    }
+
+    fn get_bytes(&mut self, need: usize) -> Result<&[u8]> {
+        if self.byte_pos + need >= self.bytes.len() {
+            return Err(anyhow::anyhow!("Unexpected EOF"));
+        }
+
+        let s = &self.bytes[self.byte_pos..self.byte_pos + need];
+        self.byte_pos += need;
+
+        Ok(s)
+    }
+
+    fn discard(&mut self) {
+        self.buf = 0;
+        self.bits_in_buf = 0;
     }
 }

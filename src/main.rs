@@ -23,7 +23,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Some(Commands::Extract) => {
-            let input = fs::read("./gzip.rs.gz").context("read test file")?;
+            let input = fs::read("./test_uncompressed.gz").context("read test file")?;
             let mut decoder = Decoder::new(&input);
             match decoder.decode() {
                 Ok(output) => {
