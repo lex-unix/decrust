@@ -115,7 +115,33 @@ impl<'a> Decoder<'a> {
 
         let mut bitstream = BitStream::new(&self.input_stream[self.pos..]);
 
-        infalte(&mut bitstream)
+        let out = infalte(&mut bitstream)?;
+
+        let crc = Crc32::new();
+        let calculate_crc = crc.checksum(&out);
+        let stored_crc = u32::from_le_bytes([
+            self.input_stream[self.input_stream.len() - 8],
+            self.input_stream[self.input_stream.len() - 7],
+            self.input_stream[self.input_stream.len() - 6],
+            self.input_stream[self.input_stream.len() - 5],
+        ]);
+
+        if calculate_crc != stored_crc {
+            return Err(anyhow::anyhow!("crc mismatch"));
+        }
+
+        let isize = u32::from_le_bytes([
+            self.input_stream[self.input_stream.len() - 4],
+            self.input_stream[self.input_stream.len() - 3],
+            self.input_stream[self.input_stream.len() - 2],
+            self.input_stream[self.input_stream.len() - 1],
+        ]);
+
+        if out.len() % (2 << 31) != isize as usize {
+            return Err(anyhow::anyhow!("size mismatch"));
+        }
+
+        Ok(out)
     }
 
     fn read_byte(&mut self) -> Result<u8> {
@@ -425,5 +451,40 @@ impl<'a> BitStream<'a> {
     fn discard(&mut self) {
         self.buf = 0;
         self.bits_in_buf = 0;
+    }
+}
+
+struct Crc32 {
+    table: [u32; 256],
+}
+
+impl Crc32 {
+    fn new() -> Self {
+        let mut table = [0u32; 256];
+
+        for i in 0..256 {
+            let mut crc = i as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = 0xedb88320 ^ (crc >> 1);
+                } else {
+                    crc >>= 1;
+                }
+            }
+            table[i] = crc;
+        }
+
+        Crc32 { table }
+    }
+
+    fn checksum(&self, data: &[u8]) -> u32 {
+        let mut crc = 0xffffffff_u32;
+
+        for &byte in data {
+            let table_index = ((crc ^ byte as u32) & 0xff) as usize;
+            crc = self.table[table_index] ^ (crc >> 8);
+        }
+
+        crc ^ 0xffffffff
     }
 }
