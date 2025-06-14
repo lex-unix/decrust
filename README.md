@@ -2,7 +2,7 @@
 > This crate was written for learning purposes and contains an untested, unoptimized version of the DEFLATE algorithm.
 > For production use, consider well-tested libraries like `flate2`.
 
-# `encrust`
+# `decrust`
 
 A simple gzip decompression tool written in Rust, implementing the DEFLATE algorithm (decoding part) from scratch.
 

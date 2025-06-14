@@ -1,7 +1,7 @@
 use std::fs;
 
 use anyhow::{Context, Result};
-use encrust::gzip::Decoder;
+use decrust::gzip::Decoder;
 
 fn main() -> Result<()> {
     let Some(filename) = std::env::args().nth(1) else {
