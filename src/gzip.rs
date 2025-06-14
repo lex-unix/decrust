@@ -1,4 +1,4 @@
-use anyhow::{self, Ok, Result, bail, ensure};
+use anyhow::{self, Result, bail, ensure};
 
 const ID1: u8 = 0x1F;
 const ID2: u8 = 0x8B;
@@ -113,6 +113,8 @@ impl<'a> Decoder<'a> {
     pub fn decode(&mut self) -> Result<Vec<u8>> {
         self.parse_header()?;
 
+        println!("header parsed");
+
         let mut bitstream = BitStream::new(&self.input_stream[self.pos..]);
 
         infalte(&mut bitstream)
@@ -159,7 +161,10 @@ fn infalte(bitstream: &mut BitStream) -> Result<Vec<u8>> {
         match block_type {
             0 => todo!("uncompressed block"),
             1 => huff_fixed(bitstream, &mut output)?,
-            2 => todo!("compressed with dynamic huffman codes"),
+            2 => {
+                println!("dynamic huffman compression");
+                huff_dynamic(bitstream, &mut output)?;
+            }
             _ => bail!("reserved block type"),
         };
 
@@ -173,22 +178,86 @@ fn infalte(bitstream: &mut BitStream) -> Result<Vec<u8>> {
 
 #[derive(Debug, Default)]
 struct Huffman {
-    symbols: Vec<u16>,
-    count: Vec<u16>,
+    symbols: Vec<u32>,
+    count: Vec<u32>,
 }
 
 fn huff_fixed(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
-    let mut lengths: [u16; 288] = [0; 288];
+    let mut lengths: [u32; 288] = [0; 288];
     lengths[..=143].fill(8);
     lengths[144..=255].fill(9);
     lengths[256..=279].fill(7);
     lengths[280..=287].fill(8);
 
-    let distances: [u16; 30] = [5; 30];
+    let distances: [u32; 30] = [5; 30];
 
     let len_huff = huff_table(&lengths);
     let dist_huff = huff_table(&distances);
 
+    codes(bitstream, output, &len_huff, &dist_huff)
+}
+
+fn huff_dynamic(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
+    let order: [u16; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    let mut lengths: [u32; 19] = [0; 19];
+
+    let hlit = bitstream.read(5)? + 257;
+    let hdist = bitstream.read(5)? + 1;
+    let hclen = bitstream.read(4)? + 4;
+
+    for i in 0..hclen {
+        lengths[order[i as usize] as usize] = bitstream.read(3)?;
+    }
+    for i in hclen..19 {
+        lengths[order[i as usize] as usize] = 0;
+    }
+
+    let lencode_huff = huff_table(&lengths);
+    let mut lengths: [u32; 316] = [0; 316];
+    let mut index: u32 = 0;
+
+    while index < hlit + hdist {
+        let mut symbol = decode(bitstream, &lencode_huff)?;
+        if symbol < 16 {
+            lengths[index as usize] = symbol;
+            index += 1;
+        } else {
+            let mut len = 0;
+            match symbol {
+                16 => {
+                    len = lengths[(index - 1) as usize];
+                    symbol = 3 + bitstream.read(2)?;
+                }
+                17 => {
+                    symbol = 3 + bitstream.read(3)?;
+                }
+                _ => {
+                    symbol = 11 + bitstream.read(7)?;
+                }
+            }
+            while symbol != 0 {
+                lengths[index as usize] = len;
+                symbol -= 1;
+                index += 1;
+            }
+        }
+    }
+
+    let len_huff = huff_table(&lengths[..hlit as usize]);
+    let dist_huff = huff_table(&lengths[(hlit as usize)..]);
+
+    codes(bitstream, output, &len_huff, &dist_huff)
+}
+
+fn codes(
+    bitstream: &mut BitStream,
+    output: &mut Vec<u8>,
+    len_huff: &Huffman,
+    dist_huff: &Huffman,
+) -> Result<()> {
     let lens = [
         /* Size base for length codes 257..285 */
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
@@ -220,7 +289,6 @@ fn huff_fixed(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
                 ensure!(symbol < 29, "invalid symbol len");
                 let mut len = lens[symbol as usize] + bitstream.read(lext[symbol as usize])?;
                 let symbol = decode(bitstream, &dist_huff)?;
-                ensure!(symbol > 0, "invalid symbol len");
                 let dist = dists[symbol as usize] + bitstream.read(dext[symbol as usize])?;
                 ensure!((dist as usize) < output.len(), "invalid len symbol");
                 while len > 0 {
@@ -237,7 +305,7 @@ fn huff_fixed(bitstream: &mut BitStream, output: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn huff_table(code_lengths: &[u16]) -> Huffman {
+fn huff_table(code_lengths: &[u32]) -> Huffman {
     let mut huff = Huffman::default();
     huff.count.resize(16, 0);
     huff.symbols.resize(288, 0);
@@ -256,7 +324,7 @@ fn huff_table(code_lengths: &[u16]) -> Huffman {
         if code_lengths[symbol] != 0 {
             let symbol_len = code_lengths[symbol];
             let offset = offsets[symbol_len as usize];
-            huff.symbols[offset as usize] = symbol as u16;
+            huff.symbols[offset as usize] = symbol as u32;
             offsets[symbol_len as usize] += 1;
         }
     }
@@ -264,7 +332,7 @@ fn huff_table(code_lengths: &[u16]) -> Huffman {
     huff
 }
 
-fn decode(bitstream: &mut BitStream, huff: &Huffman) -> Result<u16, anyhow::Error> {
+fn decode(bitstream: &mut BitStream, huff: &Huffman) -> Result<u32, anyhow::Error> {
     let mut code: u32 = 0;
     let mut first: u32 = 0;
     let mut index: u32 = 0;
@@ -312,7 +380,12 @@ impl<'a> BitStream<'a> {
 
         while self.bits_in_buf < need {
             if self.byte_pos == self.bytes.len() {
-                bail!("Unexpected EOF")
+                bail!(
+                    "Unexpected EOF: total bytes - {}, byte_pos - {}, need - {}",
+                    self.bytes.len(),
+                    self.byte_pos,
+                    need
+                )
             }
             val |= (self.bytes[self.byte_pos] as u32) << self.bits_in_buf;
             self.byte_pos += 1;
